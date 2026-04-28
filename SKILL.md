@@ -1,111 +1,41 @@
 ---
 name: web-search
-description: Searches the web using DuckDuckGo. Returns Instant Answer abstracts when available, and otherwise scrapes the DuckDuckGo HTML SERP and fetches the top result pages so you always get usable content. No API key required.
-metadata:
-  homepage: https://github.com/sinaghodsi93/edge-gallery-web-search
+description: Search the web for up-to-date information, news, definitions, and topic overviews. Combines DuckDuckGo Instant Answer, Wikipedia, and a reader-proxied SERP so it returns useful content for almost any query — not just the rare ones DuckDuckGo answers directly.
 ---
 
 # Web Search
 
-Search the web with a two-stage strategy:
+## Instructions
 
-1. **Instant Answer API** (`api.duckduckgo.com`) — fast, structured
-   abstracts/definitions for queries DuckDuckGo has a direct answer for.
-2. **HTML SERP fallback** — when the Instant Answer is empty (the common
-   case for ~90% of real queries), the skill scrapes
-   `html.duckduckgo.com/html/` for organic result links and then fetches
-   the actual page content from the top results, returning extracted text
-   so the model has something concrete to summarize.
+Call the `run_js` tool using `index.html` and a JSON string for `data` with the following fields:
 
-No API key is required.
+- **query**: Required. The search topic in natural language. Prefer short keyword form (3–8 words) over long sentences — strip filler words like "what is", "tell me about", "can you find". Keep entity names, dates, and distinguishing terms. Examples: `"2026 Oscars best picture"`, `"kubernetes pod eviction signals"`, `"webgpu safari support"`. For time-sensitive or recurring topics (elections, awards, sports seasons, releases), include the year. If the user omits the year, default to the current year.
+- **lang**: Required. The 2-letter language code matching the language of the `query` you provided. Use standard codes, e.g. `"en"` (English), `"es"` (Spanish), `"zh"` (Chinese), `"fr"` (French), `"de"` (German), `"ja"` (Japanese), `"ko"` (Korean), `"it"` (Italian), `"pt"` (Portuguese), `"ru"` (Russian), `"ar"` (Arabic), `"hi"` (Hindi).
 
-## When to use
-
-Invoke this skill when the user asks a factual question, requests a
-definition, or wants a topic overview that benefits from up-to-date
-public information (e.g. "what is X?", "who is Y?", "search the web for Z",
-"latest on …").
-
-## How it works
+The tool returns a JSON object: `{ "result": "<plain-text bundle>" }` on success, or `{ "error": "..." }` on failure. The `result` text contains these labelled sections (any may be absent):
 
 ```
-1. GET https://api.duckduckgo.com/?q=<QUERY>&format=json&no_html=1&skip_disambig=1
-   -> if AbstractText / Answer / Definition is non-empty, return it.
+QUERY: <echo>
+ANSWER: <DuckDuckGo direct answer, if any>
+ABSTRACT: <DuckDuckGo abstract, if any>
+DEFINITION: <DuckDuckGo definition, if any>
 
-2. Otherwise:
-   GET https://html.duckduckgo.com/html/?q=<QUERY>
-   -> parse <a class="result__a"> links (decoding the /l/?uddg= wrapper),
-      then for the top 3 results, fetch the page and extract plain text
-      (script/style/comments stripped, entities decoded, whitespace
-      collapsed, capped at 4000 chars per page).
+WIKIPEDIA:
+- <article title> — <url>
+  <1–3 sentence extract>
+
+PAGES:
+[1] <result title> — <url>
+<extracted page content, ~2500 chars>
+[2] ...
 ```
 
-Each outbound request uses a desktop User-Agent and an 8s timeout.
-Page-content fetches are best-effort: failures are skipped silently so a
-single bad URL doesn't break the response.
+If the result text contains `NO_DIRECT_INFO_FOUND`, no source returned usable content — say so to the user and offer the `CANDIDATE_LINKS` (if any).
 
-## Usage
+**Constraints:**
 
-```
-node scripts/search.js "<query>"
-```
-
-Programmatically:
-
-```js
-const { search } = require('./scripts/search.js');
-const result = await search('your query');
-```
-
-Summarize the response in natural language. Prefer `answer` / `abstract`
-/ `definition` when present; otherwise synthesize from `pages[].content`
-and cite `pages[].url`.
-
-## Parameters
-
-- `query` (string, required): The search query in natural language.
-
-## Output shape
-
-```json
-{
-  "heading": "...",
-  "answer": "...",
-  "abstract": "...",
-  "abstractUrl": "...",
-  "definition": "...",
-  "definitionUrl": "...",
-  "relatedTopics": [
-    { "text": "...", "url": "..." }
-  ],
-  "results": [
-    { "title": "...", "url": "..." }
-  ],
-  "pages": [
-    { "title": "...", "url": "...", "content": "extracted plain text…" }
-  ]
-}
-```
-
-- `results` and `pages` are populated **only** when the Instant Answer
-  fields are empty (i.e., the fallback path ran).
-- `pages[].content` is plain text with HTML stripped, capped at 4000
-  characters per page.
-
-## Tuning
-
-These constants live at the top of `scripts/search.js`:
-
-- `MAX_PAGES` (default `3`) — how many top SERP results to fetch.
-- `MAX_CHARS_PER_PAGE` (default `4000`) — per-page text cap.
-- `FETCH_TIMEOUT_MS` (default `8000`) — per-request timeout.
-
-## Notes
-
-- The HTML SERP endpoint is unauthenticated but unofficial; DuckDuckGo
-  may change its markup. The parser targets `a.result__a` and the
-  `/l/?uddg=` redirect wrapper.
-- Page extraction is text-only — it does not execute JavaScript, so
-  heavily client-rendered sites may yield little content. The model
-  should fall back to `results[]` titles/URLs in that case.
-- Respect rate limits; avoid tight loops over many queries.
+- Provide a concise answer (1–4 complete sentences) grounded in the returned text. Always end with a finished sentence. Your response **must be written in the same language** as the user's original prompt.
+- Prefer `ANSWER` / `ABSTRACT` / `DEFINITION` when present — they are direct, structured answers. Otherwise synthesize from `WIKIPEDIA` and `PAGES`, and cite the most relevant source URL inline.
+- If the user's exact question is not answered by the returned text, briefly acknowledge this, then proactively offer the closest related fact you *did* find rather than guessing.
+- Do not invent details that aren't in the returned text. If a section is absent, treat it as missing data, not as a negative answer.
+- Quote at most ~125 characters from any single source; paraphrase otherwise.

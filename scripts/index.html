@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Web Search</title>
+</head>
+<body>
+<script>
+/*
+ * Web Search skill for Google AI Edge Gallery.
+ * Entry point follows the Edge Gallery contract:
+ *   window["ai_edge_gallery_get_result"] = async (jsonString) => string
+ *
+ * Input JSON: { "query": "<text>", "lang": "en" }   // lang optional, default "en"
+ * Output JSON: { "result": "<plain-text bundle>" }  or  { "error": "..." }
+ *
+ * Sources (all CORS-friendly from a webview):
+ *   - api.duckduckgo.com (Instant Answer)
+ *   - <lang>.wikipedia.org (Action API + REST summary, origin=*)
+ *   - r.jina.ai (reader proxy: returns clean markdown for any URL,
+ *                used both to scrape a Bing SERP and to extract page text)
+ */
+
+const MAX_PAGES = 3;
+const MAX_PAGES_DEEP = 4;
+const MAX_CHARS_PER_PAGE = 2500;
+const MAX_WIKI_ARTICLES = 2;
+const FETCH_TIMEOUT_MS = 12000;
+const MIN_GOOD_PAGES = 2;
+const MIN_PAGE_CHARS = 400;
+const MAX_TOTAL_CHARS = 12000;
+
+async function fetchWithTimeout(url, opts) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try { return await fetch(url, Object.assign({ signal: ctrl.signal }, opts || {})); }
+  finally { clearTimeout(t); }
+}
+
+async function instantAnswer(query) {
+  try {
+    const r = await fetchWithTimeout(
+      "https://api.duckduckgo.com/?q=" + encodeURIComponent(query) +
+      "&format=json&no_html=1&skip_disambig=1",
+      { headers: { Accept: "application/json" } }
+    );
+    if (!r.ok) return {};
+    return await r.json();
+  } catch { return {}; }
+}
+
+async function wikipediaArticles(query, lang) {
+  const host = "https://" + (lang || "en") + ".wikipedia.org";
+  const out = [];
+  try {
+    const sUrl = host + "/w/api.php?action=query&format=json&list=search" +
+                 "&srlimit=" + MAX_WIKI_ARTICLES +
+                 "&srsearch=" + encodeURIComponent(query) + "&origin=*";
+    const sRes = await fetchWithTimeout(sUrl, { headers: { Accept: "application/json" } });
+    if (!sRes.ok) return out;
+    const sJson = await sRes.json();
+    const titles = ((sJson.query && sJson.query.search) || [])
+      .map(h => h.title).filter(Boolean).slice(0, MAX_WIKI_ARTICLES);
+    for (const title of titles) {
+      try {
+        const u = host + "/api/rest_v1/page/summary/" +
+                  encodeURIComponent(title.replace(/ /g, "_"));
+        const r = await fetchWithTimeout(u, { headers: { Accept: "application/json" } });
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (!j.extract) continue;
+        out.push({
+          title: j.title || title,
+          url: (j.content_urls && j.content_urls.desktop && j.content_urls.desktop.page) ||
+               (host + "/wiki/" + encodeURIComponent(title.replace(/ /g, "_"))),
+          extract: j.extract,
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return out;
+}
+
+function decodeBingRedirect(href) {
+  // Bing wraps real result URLs in https://www.bing.com/ck/a?...&u=a1<base64>&ntb=1
+  // The `u` param is the actual destination, base64url-encoded with an "a1" prefix.
+  try {
+    const u = new URL(href);
+    if (!/(^|\.)bing\.com$/i.test(u.hostname)) return null;
+    if (!/^\/ck\/a\/?$/.test(u.pathname)) return null;
+    let enc = u.searchParams.get("u") || "";
+    if (!enc) return null;
+    enc = enc.replace(/^a1/, "").replace(/-/g, "+").replace(/_/g, "/");
+    enc += "=".repeat((4 - (enc.length % 4)) % 4);
+    const decoded = atob(enc);
+    return /^https?:\/\//i.test(decoded) ? decoded : null;
+  } catch { return null; }
+}
+
+async function bingSerpViaJina(query) {
+  try {
+    const url = "https://r.jina.ai/https://www.bing.com/search?q=" + encodeURIComponent(query);
+    const r = await fetchWithTimeout(url, { headers: { Accept: "text/plain, text/markdown" } });
+    if (!r.ok) return [];
+    const md = await r.text();
+    const results = [];
+    const seen = new Set();
+    const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    let m;
+    while ((m = re.exec(md)) !== null) {
+      let title = m[1].trim();
+      let href = m[2];
+      // Unwrap Bing redirector to the real target.
+      const decoded = decodeBingRedirect(href);
+      if (decoded) href = decoded;
+      // Now skip anything still pointing to Bing/Microsoft chrome.
+      if (/(?:^|\.)bing\.com\//i.test(href)) continue;
+      if (/(?:^|\.)microsoft(?:translator)?\.com\//i.test(href)) continue;
+      if (/(?:^|\.)go\.microsoft\.com\//i.test(href)) continue;
+      if (/^https?:\/\/r\.bing\.com\//i.test(href)) continue;
+      if (/^https?:\/\/th\.bing\.com\//i.test(href)) continue;
+      // Clean image-prefix titles like "Image 17: Global web icon Title…".
+      title = title.replace(/^image\s+\d+:?\s*/i, "").trim();
+      title = title.replace(/^global\s+web\s+icon\s*/i, "").trim();
+      if (!title || title.length < 3) continue;
+      if (seen.has(href)) continue;
+      seen.add(href);
+      results.push({ title, url: href });
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch { return []; }
+}
+
+async function fetchPageViaJina(url) {
+  try {
+    const r = await fetchWithTimeout("https://r.jina.ai/" + url,
+      { headers: { Accept: "text/plain, text/markdown" } });
+    if (!r.ok) return "";
+    const text = await r.text();
+    return text.trim().slice(0, MAX_CHARS_PER_PAGE);
+  } catch { return ""; }
+}
+
+function relatedTopicsFrom(ia) {
+  const out = [];
+  for (const t of ia.RelatedTopics || []) {
+    if (t.Text && t.FirstURL) out.push({ title: t.Text, url: t.FirstURL });
+    else if (Array.isArray(t.Topics)) {
+      for (const sub of t.Topics) {
+        if (sub.Text && sub.FirstURL) out.push({ title: sub.Text, url: sub.FirstURL });
+      }
+    }
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function format(query, ia, wiki, results, pages, escalations) {
+  const lines = [];
+  lines.push("QUERY: " + query);
+  if (ia.Answer) lines.push("ANSWER: " + ia.Answer);
+  if (ia.AbstractText) {
+    lines.push("ABSTRACT: " + ia.AbstractText);
+    if (ia.AbstractURL) lines.push("ABSTRACT_URL: " + ia.AbstractURL);
+  }
+  if (ia.Definition) {
+    lines.push("DEFINITION: " + ia.Definition);
+    if (ia.DefinitionURL) lines.push("DEFINITION_URL: " + ia.DefinitionURL);
+  }
+  if (wiki.length) {
+    lines.push("");
+    lines.push("WIKIPEDIA:");
+    for (const w of wiki) {
+      lines.push("- " + w.title + " — " + w.url);
+      lines.push("  " + w.extract);
+    }
+  }
+  if (pages.length) {
+    lines.push("");
+    lines.push("PAGES:");
+    pages.forEach((p, i) => {
+      lines.push("[" + (i + 1) + "] " + p.title + " — " + p.url);
+      lines.push(p.content);
+      lines.push("");
+    });
+  }
+  const nothing = !ia.Answer && !ia.AbstractText && !ia.Definition && !wiki.length && !pages.length;
+  if (nothing) {
+    lines.push("");
+    lines.push("NO_DIRECT_INFO_FOUND");
+    if (results.length) {
+      lines.push("CANDIDATE_LINKS:");
+      for (const r of results.slice(0, 6)) lines.push("- " + r.title + " — " + r.url);
+    }
+  }
+  if (escalations.length) lines.push("\n[escalations: " + escalations.join(", ") + "]");
+  let text = lines.join("\n");
+  if (text.length > MAX_TOTAL_CHARS) {
+    text = text.substring(0, MAX_TOTAL_CHARS) + "\n\n... [TRUNCATED TO SAVE CONTEXT]";
+  }
+  return text;
+}
+
+async function runSearch(query, lang) {
+  const [ia, wiki, bing] = await Promise.all([
+    instantAnswer(query),
+    wikipediaArticles(query, lang),
+    bingSerpViaJina(query),
+  ]);
+
+  const wikiUrls = new Set(wiki.map(w => w.url));
+  const fetched = new Set();
+  const pages = [];
+
+  async function fetchBatch(candidates) {
+    const fresh = [];
+    for (const r of candidates) {
+      if (!r || !r.url) continue;
+      if (fetched.has(r.url) || wikiUrls.has(r.url)) continue;
+      fresh.push(r);
+      fetched.add(r.url);
+    }
+    const got = await Promise.all(fresh.map(async r => {
+      const content = await fetchPageViaJina(r.url);
+      return content && content.length >= MIN_PAGE_CHARS
+        ? { title: r.title, url: r.url, content } : null;
+    }));
+    for (const p of got) if (p) pages.push(p);
+  }
+
+  const escalations = [];
+  const hasInstant = ia.Answer || ia.AbstractText || ia.Definition;
+
+  await fetchBatch(bing.slice(0, MAX_PAGES));
+
+  if (pages.length < MIN_GOOD_PAGES && !hasInstant) {
+    escalations.push("serp-deep");
+    await fetchBatch(bing.slice(MAX_PAGES, MAX_PAGES + MAX_PAGES_DEEP));
+  }
+  if (pages.length < MIN_GOOD_PAGES && !hasInstant) {
+    const rel = relatedTopicsFrom(ia);
+    if (rel.length) {
+      escalations.push("related-topics");
+      await fetchBatch(rel.slice(0, MAX_PAGES_DEEP));
+    }
+  }
+  if (pages.length < MIN_GOOD_PAGES && wiki.length) {
+    escalations.push("wiki-full");
+    await fetchBatch(wiki.map(w => ({ title: w.title, url: w.url })).slice(0, 2));
+  }
+
+  return format(query, ia, wiki, bing, pages, escalations);
+}
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  try {
+    const j = JSON.parse(data);
+    const query = (j.query || j.topic || j.q || "").trim();
+    if (!query) return JSON.stringify({ error: "No query provided." });
+    const lang = (j.lang || "en").trim();
+    const result = await runSearch(query, lang);
+    return JSON.stringify({ result });
+  } catch (e) {
+    return JSON.stringify({ error: "Web search failed: " + (e && e.message || e) });
+  }
+};
+</script>
+</body>
+</html>

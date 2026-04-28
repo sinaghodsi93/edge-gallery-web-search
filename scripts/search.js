@@ -1,14 +1,28 @@
-// Web Search skill — DuckDuckGo Instant Answer + HTML fallback
+// Web Search skill — multi-source: DuckDuckGo + Wikipedia + Jina Reader.
 // Usage (Edge Gallery webview / Node 18+): search(query) -> Promise<object>
 // CLI:  node scripts/search.js "your query"
+//
+// Strategy (each layer is best-effort; failures are skipped, not thrown):
+//   1. DuckDuckGo Instant Answer API for direct abstracts/definitions.
+//   2. Wikipedia full-text search + REST summary for the top matching
+//      articles. Works for almost any noun-phrase query and is highly
+//      reliable (no bot blocks).
+//   3. DuckDuckGo HTML SERP scrape for organic web results.
+//   4. Page content fetched via Jina Reader (https://r.jina.ai/<url>),
+//      which returns clean markdown and bypasses most bot/JS walls.
+//      Direct fetch is used as a fallback if Jina fails.
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 const MAX_PAGES = 3;
-const MAX_CHARS_PER_PAGE = 4000;
-const FETCH_TIMEOUT_MS = 8000;
+const MAX_PAGES_DEEP = 5; // additional pages fetched in escalation
+const MAX_CHARS_PER_PAGE = 3500;
+const MAX_WIKI_ARTICLES = 2;
+const FETCH_TIMEOUT_MS = 10000;
+const MIN_GOOD_PAGES = 2;   // below this, escalate
+const MIN_PAGE_CHARS = 400; // a page is "substantive" only above this
 
 async function fetchWithTimeout(url, opts = {}) {
   const ctrl = new AbortController();
@@ -38,32 +52,159 @@ function stripHtml(html) {
     .trim();
 }
 
-async function duckduckgoHtmlSearch(query) {
+async function instantAnswer(query) {
   const url =
-    'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
-  const res = await fetchWithTimeout(url, {
-    headers: { 'User-Agent': UA, Accept: 'text/html' },
-  });
-  if (!res.ok) return [];
-  const html = await res.text();
-
-  const results = [];
-  const re = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    let href = m[1];
-    // DuckDuckGo wraps real URLs in /l/?uddg=<encoded>
-    const uddg = /[?&]uddg=([^&]+)/.exec(href);
-    if (uddg) href = decodeURIComponent(uddg[1]);
-    if (!/^https?:\/\//.test(href)) continue;
-    const title = stripHtml(m[2]);
-    results.push({ title, url: href });
-    if (results.length >= 8) break;
+    'https://api.duckduckgo.com/?q=' +
+    encodeURIComponent(query) +
+    '&format=json&no_html=1&skip_disambig=1';
+  try {
+    const res = await fetchWithTimeout(url, {
+      headers: { Accept: 'application/json', 'User-Agent': UA },
+    });
+    if (!res.ok) return {};
+    return await res.json();
+  } catch {
+    return {};
   }
-  return results;
 }
 
-async function fetchPageText(url) {
+async function wikipediaArticles(query) {
+  try {
+    const sUrl =
+      'https://en.wikipedia.org/w/api.php?action=query&format=json' +
+      '&list=search&srlimit=' +
+      MAX_WIKI_ARTICLES +
+      '&srsearch=' +
+      encodeURIComponent(query) +
+      '&origin=*';
+    const sRes = await fetchWithTimeout(sUrl, {
+      headers: { Accept: 'application/json', 'User-Agent': UA },
+    });
+    if (!sRes.ok) return [];
+    const sJson = await sRes.json();
+    const titles = (sJson.query && sJson.query.search ? sJson.query.search : [])
+      .map((h) => h.title)
+      .filter(Boolean)
+      .slice(0, MAX_WIKI_ARTICLES);
+
+    const summaries = await Promise.all(
+      titles.map(async (title) => {
+        try {
+          const u =
+            'https://en.wikipedia.org/api/rest_v1/page/summary/' +
+            encodeURIComponent(title.replace(/ /g, '_'));
+          const r = await fetchWithTimeout(u, {
+            headers: { Accept: 'application/json', 'User-Agent': UA },
+          });
+          if (!r.ok) return null;
+          const j = await r.json();
+          if (!j.extract) return null;
+          return {
+            title: j.title || title,
+            url:
+              (j.content_urls &&
+                j.content_urls.desktop &&
+                j.content_urls.desktop.page) ||
+              'https://en.wikipedia.org/wiki/' +
+                encodeURIComponent(title.replace(/ /g, '_')),
+            extract: j.extract,
+          };
+        } catch {
+          return null;
+        }
+      })
+    );
+    return summaries.filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function bingSearchViaJina(query) {
+  // Fetches Bing's SERP through Jina Reader (which returns markdown) and
+  // extracts external result URLs. Used as an alternate SERP when DDG is
+  // empty or blocked.
+  try {
+    const url =
+      'https://r.jina.ai/https://www.bing.com/search?q=' +
+      encodeURIComponent(query);
+    const res = await fetchWithTimeout(url, {
+      headers: { 'User-Agent': UA, Accept: 'text/plain, text/markdown' },
+    });
+    if (!res.ok) return [];
+    const md = await res.text();
+    const results = [];
+    const seen = new Set();
+    const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    let m;
+    while ((m = re.exec(md)) !== null) {
+      const title = m[1].trim();
+      const href = m[2];
+      if (
+        /(?:^|\.)bing\.com\//i.test(href) ||
+        /(?:^|\.)microsoft\.com\//i.test(href) ||
+        /(?:^|\.)microsofttranslator\.com\//i.test(href) ||
+        /(?:^|\.)go\.microsoft\.com\//i.test(href) ||
+        /^https?:\/\/r\.bing\.com\//i.test(href)
+      )
+        continue;
+      if (!title || title.length < 3 || /^image\s+\d+/i.test(title)) continue;
+      if (seen.has(href)) continue;
+      seen.add(href);
+      results.push({ title, url: href });
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+async function duckduckgoHtmlSearch(query) {
+  try {
+    const url =
+      'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+    const res = await fetchWithTimeout(url, {
+      headers: { 'User-Agent': UA, Accept: 'text/html' },
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const results = [];
+    const re =
+      /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      let href = m[1];
+      const uddg = /[?&]uddg=([^&]+)/.exec(href);
+      if (uddg) href = decodeURIComponent(uddg[1]);
+      if (!/^https?:\/\//.test(href)) continue;
+      // Drop the DDG anti-abuse redirector if it ever leaks through.
+      if (/^https?:\/\/(?:[^/]*\.)?duckduckgo\.com\//i.test(href)) continue;
+      const title = stripHtml(m[2]);
+      results.push({ title, url: href });
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+async function fetchViaJina(url) {
+  try {
+    const res = await fetchWithTimeout('https://r.jina.ai/' + url, {
+      headers: { 'User-Agent': UA, Accept: 'text/plain, text/markdown' },
+    });
+    if (!res.ok) return '';
+    const text = await res.text();
+    // Jina returns markdown with a small header block — keep as-is, just trim.
+    return text.trim().slice(0, MAX_CHARS_PER_PAGE);
+  } catch {
+    return '';
+  }
+}
+
+async function fetchDirect(url) {
   try {
     const res = await fetchWithTimeout(url, {
       headers: { 'User-Agent': UA, Accept: 'text/html,*/*' },
@@ -73,11 +214,18 @@ async function fetchPageText(url) {
     const ct = res.headers.get('content-type') || '';
     if (!/text\/html|text\/plain|application\/xhtml/i.test(ct)) return '';
     const html = await res.text();
-    const text = stripHtml(html);
-    return text.slice(0, MAX_CHARS_PER_PAGE);
+    return stripHtml(html).slice(0, MAX_CHARS_PER_PAGE);
   } catch {
     return '';
   }
+}
+
+async function fetchPageContent(url) {
+  const viaJina = await fetchViaJina(url);
+  if (viaJina && viaJina.length > 200) return { content: viaJina, via: 'jina' };
+  const direct = await fetchDirect(url);
+  if (direct) return { content: direct, via: 'direct' };
+  return { content: '', via: '' };
 }
 
 async function search(query) {
@@ -85,23 +233,15 @@ async function search(query) {
     throw new Error('search(query): query must be a non-empty string');
   }
 
-  const iaUrl =
-    'https://api.duckduckgo.com/?q=' +
-    encodeURIComponent(query) +
-    '&format=json&no_html=1&skip_disambig=1';
-
-  let data = {};
-  try {
-    const res = await fetchWithTimeout(iaUrl, {
-      headers: { Accept: 'application/json', 'User-Agent': UA },
-    });
-    if (res.ok) data = await res.json();
-  } catch {
-    data = {};
-  }
+  // Run the three lookups in parallel.
+  const [ia, wiki, serp] = await Promise.all([
+    instantAnswer(query),
+    wikipediaArticles(query),
+    duckduckgoHtmlSearch(query),
+  ]);
 
   const relatedTopics = [];
-  for (const t of data.RelatedTopics || []) {
+  for (const t of ia.RelatedTopics || []) {
     if (t.Text && t.FirstURL) {
       relatedTopics.push({ text: t.Text, url: t.FirstURL });
     } else if (Array.isArray(t.Topics)) {
@@ -114,36 +254,75 @@ async function search(query) {
     if (relatedTopics.length >= 8) break;
   }
 
-  const out = {
-    heading: data.Heading || '',
-    answer: data.Answer || '',
-    abstract: data.AbstractText || '',
-    abstractUrl: data.AbstractURL || '',
-    definition: data.Definition || '',
-    definitionUrl: data.DefinitionURL || '',
+  const wikiUrls = new Set(wiki.map((w) => w.url));
+  const fetchedUrls = new Set();
+  const pages = [];
+
+  async function fetchBatch(candidates) {
+    const fresh = [];
+    for (const r of candidates) {
+      if (!r || !r.url) continue;
+      if (fetchedUrls.has(r.url)) continue;
+      if (wikiUrls.has(r.url)) continue;
+      fresh.push(r);
+      fetchedUrls.add(r.url);
+    }
+    const got = await Promise.all(
+      fresh.map(async (r) => {
+        const { content, via } = await fetchPageContent(r.url);
+        return content && content.length >= MIN_PAGE_CHARS
+          ? { title: r.title, url: r.url, via, content }
+          : null;
+      })
+    );
+    for (const p of got) if (p) pages.push(p);
+  }
+
+  // Phase 1: top-N from primary SERP.
+  let allResults = serp.slice();
+  await fetchBatch(allResults.slice(0, MAX_PAGES));
+
+  const escalations = [];
+  const hasInstant = ia.Answer || ia.AbstractText || ia.Definition;
+
+  // Phase 2: dig deeper if the first pass came up thin.
+  if (pages.length < MIN_GOOD_PAGES && !hasInstant) {
+    escalations.push('serp-deep');
+    await fetchBatch(allResults.slice(MAX_PAGES, MAX_PAGES + MAX_PAGES_DEEP));
+  }
+
+  // Phase 3: alternate SERP (Bing via Jina) if DDG was empty/blocked or
+  // the deep dig still hasn't produced enough content.
+  if (pages.length < MIN_GOOD_PAGES && !hasInstant) {
+    escalations.push('bing');
+    const bing = await bingSearchViaJina(query);
+    const seenUrls = new Set(allResults.map((r) => r.url));
+    for (const r of bing) if (!seenUrls.has(r.url)) allResults.push(r);
+    await fetchBatch(bing.slice(0, MAX_PAGES_DEEP));
+  }
+
+  // Phase 4: pull full Wikipedia article bodies via Jina if we have wiki
+  // candidates but still nothing else substantive.
+  if (pages.length < MIN_GOOD_PAGES && wiki.length > 0) {
+    escalations.push('wiki-full');
+    await fetchBatch(
+      wiki.map((w) => ({ title: w.title, url: w.url })).slice(0, 2)
+    );
+  }
+
+  return {
+    heading: ia.Heading || '',
+    answer: ia.Answer || '',
+    abstract: ia.AbstractText || '',
+    abstractUrl: ia.AbstractURL || '',
+    definition: ia.Definition || '',
+    definitionUrl: ia.DefinitionURL || '',
     relatedTopics,
-    results: [],
-    pages: [],
+    wikipedia: wiki,
+    results: allResults,
+    pages,
+    escalations,
   };
-
-  const hasInstant = out.answer || out.abstract || out.definition;
-  if (hasInstant) return out;
-
-  // Fallback: scrape DuckDuckGo HTML SERP and fetch top page contents.
-  const serp = await duckduckgoHtmlSearch(query);
-  out.results = serp;
-
-  const targets = serp.slice(0, MAX_PAGES);
-  const fetched = await Promise.all(
-    targets.map(async (r) => ({
-      title: r.title,
-      url: r.url,
-      content: await fetchPageText(r.url),
-    }))
-  );
-  out.pages = fetched.filter((p) => p.content);
-
-  return out;
 }
 
 if (typeof module !== 'undefined') {
