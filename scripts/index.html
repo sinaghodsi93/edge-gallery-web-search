@@ -31,11 +31,101 @@ const MIN_GOOD_PAGES = 2;
 const MIN_PAGE_CHARS = 400;
 const MAX_TOTAL_CHARS = 12000;
 
+// Weather keywords across common languages — used to detect weather intent
+// and to strip the keyword to recover the city name.
+const WEATHER_RE = /\b(weather|forecast|temperature|wetter|tiempo|clima|météo|meteo|погода|天気|天气|날씨|طقس|hava|hava\s+durumu|cuaca|พยากรณ์|พยากรณ์อากาศ|อากาศ)\b/i;
+
+// Filler phrases small LLMs and users tack onto queries. Stripping them
+// improves Wikipedia and DuckDuckGo Instant Answer hit rates.
+const FILLER_RE = /^\s*(?:what(?:'s| is)|who(?:'s| is)|where(?:'s| is)|when(?:'s| is)|tell me (?:about|the)|define|definition of|meaning of|current|the current|show me|give me|search( for)?|find|look up|can you (?:tell|find|search|look up)(?: me)?(?: about)?)\s+/i;
+
+function normalizeQuery(q) {
+  let s = (q || "").trim().replace(/\?+\s*$/, "");
+  // Strip up to two layers of filler ("can you tell me about X").
+  for (let i = 0; i < 2; i++) {
+    const next = s.replace(FILLER_RE, "");
+    if (next === s) break;
+    s = next;
+  }
+  return s.trim();
+}
+
 async function fetchWithTimeout(url, opts) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try { return await fetch(url, Object.assign({ signal: ctrl.signal }, opts || {})); }
   finally { clearTimeout(t); }
+}
+
+// Words that look like places after the keyword is stripped but aren't.
+// Without this guard, wttr.in happily resolves "right now" to a random
+// hamlet and returns confidently wrong data.
+const PLACE_STOPWORDS = new Set([
+  "right","now","today","tonight","tomorrow","yesterday","current","currently",
+  "outside","here","there","this","week","weekend","morning","afternoon","evening",
+  "the","a","an","like","please","forecast","weather","temperature",
+  "heute","jetzt","morgen","gestern","draußen",
+  "ahora","hoy","mañana","actual","actualmente",
+  "maintenant","aujourd'hui","actuel",
+  "сейчас","сегодня","завтра",
+]);
+
+function looksLikePlace(s) {
+  if (!s) return false;
+  const tokens = s.toLowerCase().split(/[\s,.;:!?]+/).filter(Boolean);
+  if (!tokens.length) return false;
+  const meaningful = tokens.filter(t => !PLACE_STOPWORDS.has(t));
+  if (!meaningful.length) return false;
+  // Reject pure-numeric or 1-letter residuals.
+  if (meaningful.every(t => /^\d+$/.test(t) || t.length < 2)) return false;
+  return true;
+}
+
+// wttr.in is a free, key-less weather service. j1 format returns rich JSON;
+// it handles ambiguous city names, IATA codes, and ~ (no city = IP-located).
+async function weatherLookup(query) {
+  // Try to extract a place: drop the weather keyword and any leading
+  // preposition like "in" / "for" / "at" (multi-lingual: en/de/es/fr/it/pt).
+  let place = query.replace(WEATHER_RE, " ").trim();
+  place = place.replace(/^\s*(?:in|at|for|of|à|en|à\s+|in\s+|de|del|do|da|en\s+|w|na|во|в)\s+/i, "");
+  place = place.replace(/[?.,!]+$/g, "").trim();
+  if (!place || !looksLikePlace(place)) return null;
+  try {
+    const url = "https://wttr.in/" + encodeURIComponent(place) + "?format=j1";
+    const r = await fetchWithTimeout(url, { headers: { Accept: "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const cur = (j.current_condition && j.current_condition[0]) || null;
+    const area = (j.nearest_area && j.nearest_area[0]) || null;
+    if (!cur) return null;
+    const cityName =
+      (area && area.areaName && area.areaName[0] && area.areaName[0].value) ||
+      place;
+    const region =
+      (area && area.region && area.region[0] && area.region[0].value) || "";
+    const country =
+      (area && area.country && area.country[0] && area.country[0].value) || "";
+    const desc =
+      (cur.weatherDesc && cur.weatherDesc[0] && cur.weatherDesc[0].value) || "";
+    const today = (j.weather && j.weather[0]) || null;
+    const todayLine = today
+      ? "today min " + today.mintempC + "°C / max " + today.maxtempC + "°C"
+      : "";
+    return {
+      place: [cityName, region, country].filter(Boolean).join(", "),
+      observed: cur.observation_time || cur.localObsDateTime || "",
+      tempC: cur.temp_C,
+      tempF: cur.temp_F,
+      feelsLikeC: cur.FeelsLikeC,
+      desc,
+      humidity: cur.humidity,
+      windKph: cur.windspeedKmph,
+      windDir: cur.winddir16Point,
+      precipMM: cur.precipMM,
+      todayLine,
+      url: "https://wttr.in/" + encodeURIComponent(place),
+    };
+  } catch { return null; }
 }
 
 async function instantAnswer(query) {
@@ -50,35 +140,74 @@ async function instantAnswer(query) {
   } catch { return {}; }
 }
 
-async function wikipediaArticles(query, lang) {
-  const host = "https://" + (lang || "en") + ".wikipedia.org";
-  const out = [];
+async function wikiTitles(host, query) {
+  // Combine full-text search + opensearch (title-prefix). Opensearch is
+  // much better for short noun-phrase queries like "kubernetes pod eviction".
+  const titles = [];
+  const seen = new Set();
   try {
     const sUrl = host + "/w/api.php?action=query&format=json&list=search" +
                  "&srlimit=" + MAX_WIKI_ARTICLES +
                  "&srsearch=" + encodeURIComponent(query) + "&origin=*";
-    const sRes = await fetchWithTimeout(sUrl, { headers: { Accept: "application/json" } });
-    if (!sRes.ok) return out;
-    const sJson = await sRes.json();
-    const titles = ((sJson.query && sJson.query.search) || [])
-      .map(h => h.title).filter(Boolean).slice(0, MAX_WIKI_ARTICLES);
-    for (const title of titles) {
-      try {
-        const u = host + "/api/rest_v1/page/summary/" +
-                  encodeURIComponent(title.replace(/ /g, "_"));
-        const r = await fetchWithTimeout(u, { headers: { Accept: "application/json" } });
-        if (!r.ok) continue;
-        const j = await r.json();
-        if (!j.extract) continue;
-        out.push({
-          title: j.title || title,
-          url: (j.content_urls && j.content_urls.desktop && j.content_urls.desktop.page) ||
-               (host + "/wiki/" + encodeURIComponent(title.replace(/ /g, "_"))),
-          extract: j.extract,
-        });
-      } catch (_) {}
+    const r = await fetchWithTimeout(sUrl, { headers: { Accept: "application/json" } });
+    if (r.ok) {
+      const j = await r.json();
+      for (const h of (j.query && j.query.search) || []) {
+        if (h.title && !seen.has(h.title)) { seen.add(h.title); titles.push(h.title); }
+      }
     }
   } catch (_) {}
+  if (titles.length < MAX_WIKI_ARTICLES) {
+    try {
+      const oUrl = host + "/w/api.php?action=opensearch&format=json&limit=" +
+                   MAX_WIKI_ARTICLES + "&search=" + encodeURIComponent(query) +
+                   "&origin=*";
+      const r = await fetchWithTimeout(oUrl, { headers: { Accept: "application/json" } });
+      if (r.ok) {
+        const arr = await r.json();
+        for (const t of (arr && arr[1]) || []) {
+          if (t && !seen.has(t)) { seen.add(t); titles.push(t); }
+        }
+      }
+    } catch (_) {}
+  }
+  return titles.slice(0, MAX_WIKI_ARTICLES);
+}
+
+async function wikipediaFromHost(host, query) {
+  const out = [];
+  const titles = await wikiTitles(host, query);
+  for (const title of titles) {
+    try {
+      const u = host + "/api/rest_v1/page/summary/" +
+                encodeURIComponent(title.replace(/ /g, "_"));
+      const r = await fetchWithTimeout(u, { headers: { Accept: "application/json" } });
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (!j.extract) continue;
+      // Skip disambiguation stubs — they rarely help small LLMs.
+      if (j.type === "disambiguation") continue;
+      out.push({
+        title: j.title || title,
+        url: (j.content_urls && j.content_urls.desktop && j.content_urls.desktop.page) ||
+             (host + "/wiki/" + encodeURIComponent(title.replace(/ /g, "_"))),
+        extract: j.extract,
+      });
+    } catch (_) {}
+  }
+  return out;
+}
+
+async function wikipediaArticles(query, lang) {
+  const primary = "https://" + (lang || "en") + ".wikipedia.org";
+  let out = await wikipediaFromHost(primary, query);
+  // Fall back to English Wikipedia if the localized one has nothing —
+  // many edge-device users query in their language but the topic only has
+  // an English article.
+  if (!out.length && (lang || "en") !== "en") {
+    const en = await wikipediaFromHost("https://en.wikipedia.org", query);
+    out = en;
+  }
   return out;
 }
 
@@ -157,9 +286,121 @@ function relatedTopicsFrom(ia) {
   return out;
 }
 
-function format(query, ia, wiki, results, pages, escalations) {
+function formatWeather(w) {
+  const lines = [];
+  lines.push("WEATHER:");
+  lines.push("- place: " + w.place);
+  if (w.observed) lines.push("- observed: " + w.observed);
+  lines.push("- conditions: " + w.desc);
+  lines.push("- temperature: " + w.tempC + "°C (" + w.tempF + "°F), feels like " + w.feelsLikeC + "°C");
+  if (w.todayLine) lines.push("- " + w.todayLine);
+  if (w.humidity != null) lines.push("- humidity: " + w.humidity + "%");
+  if (w.windKph != null) lines.push("- wind: " + w.windKph + " km/h " + (w.windDir || ""));
+  if (w.precipMM != null) lines.push("- precipitation: " + w.precipMM + " mm");
+  lines.push("- source: " + w.url);
+  return lines.join("\n");
+}
+
+// Common short words across a few languages we don't want to use for
+// topical relevance checking — they overlap with everything.
+const STOPWORDS = new Set([
+  "the","a","an","of","in","on","at","to","for","and","or","is","are","was","were",
+  "be","by","with","as","it","this","that","these","those","from","about","into",
+  "what","who","where","when","why","how","does","do","did","can","could","would",
+  "der","die","das","und","oder","ist","sind","ein","eine","im","mit","von",
+  "el","la","los","las","y","o","de","del","en","un","una","es","son","con",
+  "le","les","et","ou","est","sont","un","une","du","des","au","aux",
+  "il","lo","gli","e","o","è","sono","un","una","del","della",
+]);
+
+function tokenize(s) {
+  return (s || "").toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/).filter(t => t && t.length >= 2 && !STOPWORDS.has(t));
+}
+
+// Heuristic: do the fetched pages actually relate to the query? If none of
+// the meaningful query tokens appear in any page title, the "results" are
+// almost certainly off-topic noise (common when DDG/Bing fall back to
+// generic ads/portals on rare or gibberish queries).
+function pagesAreOnTopic(query, pages) {
+  if (!pages.length) return false;
+  const qTokens = tokenize(query);
+  if (!qTokens.length) return false;
+  for (const p of pages) {
+    const blob = ((p.title || "") + " " + (p.content || "")).toLowerCase();
+    if (qTokens.some(t => blob.includes(t))) return true;
+  }
+  return false;
+}
+
+// Build a single ASK hint when the result is too thin or ambiguous for a
+// small LLM to answer confidently. The LLM is instructed (see SKILL.md) to
+// surface this as one short clarifying question to the user.
+function buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages) {
+  // Weather intent but no live data → almost always a missing/ambiguous city.
+  if (isWeather && !weather) {
+    return {
+      reason: "weather_city_missing",
+      question: "Which city or location should I check the weather for?",
+    };
+  }
+  const hasInstant = !!(ia.Answer || ia.AbstractText || ia.Definition);
+  const totalSignal = (hasInstant ? 1 : 0) + wiki.length + pages.length;
+
+  // DDG flagged the query as ambiguous (a disambiguation type) → ask which.
+  if (ia.Type === "D" || ia.Type === "C") {
+    const opts = (ia.RelatedTopics || [])
+      .map(t => (t.Text || "").split(" - ")[0])
+      .filter(Boolean).slice(0, 4);
+    if (opts.length >= 2) {
+      return {
+        reason: "ambiguous_term",
+        question: "\"" + query + "\" could mean several things — which did you mean: " + opts.join("; ") + "?",
+      };
+    }
+  }
+
+  // Multiple wiki hits with very different titles → likely ambiguous noun.
+  if (!hasInstant && wiki.length >= 2) {
+    const titles = wiki.map(w => w.title);
+    return {
+      reason: "ambiguous_term",
+      question: "Did you mean " + titles.slice(0, 3).join(", or ") + "?",
+    };
+  }
+
+  // Nothing came back at all → ask for a more specific phrasing.
+  if (totalSignal === 0) {
+    return {
+      reason: "no_info",
+      question: "I couldn't find anything for \"" + (rawQuery || query) + "\". Could you rephrase or add more detail (e.g. full name, year, or context)?",
+    };
+  }
+
+  // Only signal is SERP pages, but they don't share any token with the
+  // query → off-topic noise, treat as no_info.
+  if (!hasInstant && !wiki.length && pages.length && !pagesAreOnTopic(query, pages)) {
+    return {
+      reason: "no_info",
+      question: "I couldn't find a confident answer for \"" + (rawQuery || query) + "\". Could you rephrase or add more detail?",
+    };
+  }
+  return null;
+}
+
+function format(query, ia, wiki, results, pages, escalations, weather, ask) {
   const lines = [];
   lines.push("QUERY: " + query);
+  if (ask) {
+    lines.push("");
+    lines.push("ASK: " + ask.question);
+    lines.push("ASK_REASON: " + ask.reason);
+  }
+  if (weather) {
+    lines.push("");
+    lines.push(formatWeather(weather));
+  }
   if (ia.Answer) lines.push("ANSWER: " + ia.Answer);
   if (ia.AbstractText) {
     lines.push("ABSTRACT: " + ia.AbstractText);
@@ -186,7 +427,7 @@ function format(query, ia, wiki, results, pages, escalations) {
       lines.push("");
     });
   }
-  const nothing = !ia.Answer && !ia.AbstractText && !ia.Definition && !wiki.length && !pages.length;
+  const nothing = !weather && !ia.Answer && !ia.AbstractText && !ia.Definition && !wiki.length && !pages.length;
   if (nothing) {
     lines.push("");
     lines.push("NO_DIRECT_INFO_FOUND");
@@ -203,12 +444,17 @@ function format(query, ia, wiki, results, pages, escalations) {
   return text;
 }
 
-async function runSearch(query, lang) {
-  const [ia, wiki, bing] = await Promise.all([
+async function runSearch(rawQuery, lang) {
+  const query = normalizeQuery(rawQuery);
+  const isWeather = WEATHER_RE.test(rawQuery) || WEATHER_RE.test(query);
+
+  const tasks = [
     instantAnswer(query),
     wikipediaArticles(query, lang),
     bingSerpViaJina(query),
-  ]);
+    isWeather ? weatherLookup(query) : Promise.resolve(null),
+  ];
+  const [ia, wiki, bing, weather] = await Promise.all(tasks);
 
   const wikiUrls = new Set(wiki.map(w => w.url));
   const fetched = new Set();
@@ -233,6 +479,18 @@ async function runSearch(query, lang) {
   const escalations = [];
   const hasInstant = ia.Answer || ia.AbstractText || ia.Definition;
 
+  // If we got a weather hit, that's the answer — skip the SERP fan-out
+  // entirely. Edge-device LLMs don't need to wade through travel-guide pages
+  // when they already have the live conditions.
+  if (weather) {
+    return format(query, ia, wiki, bing, pages, escalations, weather, null);
+  }
+  // Weather intent but no live data → bail early and ask for a city.
+  if (isWeather && !weather) {
+    const ask = buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages);
+    return format(query, ia, wiki, bing, pages, escalations, null, ask);
+  }
+
   await fetchBatch(bing.slice(0, MAX_PAGES));
 
   if (pages.length < MIN_GOOD_PAGES && !hasInstant) {
@@ -251,7 +509,8 @@ async function runSearch(query, lang) {
     await fetchBatch(wiki.map(w => ({ title: w.title, url: w.url })).slice(0, 2));
   }
 
-  return format(query, ia, wiki, bing, pages, escalations);
+  const ask = buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages);
+  return format(query, ia, wiki, bing, pages, escalations, weather, ask);
 }
 
 window["ai_edge_gallery_get_result"] = async (data) => {
