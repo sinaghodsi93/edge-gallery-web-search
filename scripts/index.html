@@ -37,7 +37,36 @@ const WEATHER_RE = /\b(weather|forecast|temperature|wetter|tiempo|clima|météo|
 
 // Filler phrases small LLMs and users tack onto queries. Stripping them
 // improves Wikipedia and DuckDuckGo Instant Answer hit rates.
-const FILLER_RE = /^\s*(?:what(?:'s| is)|who(?:'s| is)|where(?:'s| is)|when(?:'s| is)|tell me (?:about|the)|define|definition of|meaning of|current|the current|show me|give me|search( for)?|find|look up|can you (?:tell|find|search|look up)(?: me)?(?: about)?)\s+/i;
+const FILLER_RE = new RegExp(
+  "^\\s*(?:" + [
+    // English
+    "what(?:'s| is| are| was| were)", "who(?:'s| is| was| were)",
+    "where(?:'s| is)", "when(?:'s| is| was)",
+    "tell me (?:about|the)", "define", "definition of", "meaning of",
+    "current", "the current", "show me", "give me",
+    "search(?: for)?", "find", "look up",
+    "can you (?:tell|find|search|look up)(?: me)?(?: about)?",
+    // German
+    "wer (?:ist|war|sind)", "was (?:ist|sind|war)", "wo (?:ist|sind)", "wann (?:ist|war)",
+    "erzähl(?:e)? mir (?:über|von)", "definiere", "bedeutung von",
+    // Spanish
+    "qué (?:es|son|fue)", "quién (?:es|fue|era)", "dónde (?:está|están)",
+    "cuándo (?:es|fue)", "háblame de", "define",
+    // French
+    "qu(?:'|e )est(?:-ce que)?", "qui (?:est|était|sont)", "où (?:est|sont)",
+    "quand (?:est|était)", "parle[- ]moi de", "définis(?:sez)?",
+    // Italian
+    "che cos(?:'|a )(?:è|sono)", "chi (?:è|era|sono)", "dove (?:è|sono)",
+    "quando (?:è|era)", "parlami di", "definisci",
+    // Portuguese
+    "o que (?:é|são|foi)", "quem (?:é|foi|era|são)", "onde (?:é|está|estão)",
+    "fala[- ]me de", "define",
+    // Russian (Cyrillic)
+    "кто (?:такой|такая|такие|это)", "что (?:такое|это)", "где (?:находится|это)",
+    "расскажи (?:мне )?(?:о|про)",
+  ].join("|") + ")\\s+",
+  "i"
+);
 
 function normalizeQuery(q) {
   let s = (q || "").trim().replace(/\?+\s*$/, "");
@@ -286,6 +315,35 @@ function relatedTopicsFrom(ia) {
   return out;
 }
 
+// Trim to N chars at a sentence/word boundary so small models always see a
+// finished sentence (avoids them dangling mid-clause).
+function trimToSentence(s, max) {
+  if (!s) return "";
+  s = String(s).replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max);
+  const lastDot = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("。"), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+  if (lastDot > max * 0.5) return cut.slice(0, lastDot + 1).trim();
+  const lastSpace = cut.lastIndexOf(" ");
+  return (lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trim() + "…";
+}
+
+// Pre-bake a 1–3-sentence draft answer drawn from the highest-quality
+// source available. Small edge LLMs reliably echo/translate a short draft;
+// they fail at synthesizing across labelled sections.
+function buildDraft(ia, wiki, weather) {
+  if (weather) {
+    return weather.place + ": " + weather.desc + ", " +
+      weather.tempC + "°C (feels like " + weather.feelsLikeC + "°C). " +
+      (weather.todayLine ? weather.todayLine.charAt(0).toUpperCase() + weather.todayLine.slice(1) + "." : "");
+  }
+  if (ia.Answer) return trimToSentence(ia.Answer, 400);
+  if (ia.AbstractText) return trimToSentence(ia.AbstractText, 400);
+  if (ia.Definition) return trimToSentence(ia.Definition, 400);
+  if (wiki && wiki.length && wiki[0].extract) return trimToSentence(wiki[0].extract, 400);
+  return "";
+}
+
 function formatWeather(w) {
   const lines = [];
   lines.push("WEATHER:");
@@ -361,15 +419,6 @@ function buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages) {
     }
   }
 
-  // Multiple wiki hits with very different titles → likely ambiguous noun.
-  if (!hasInstant && wiki.length >= 2) {
-    const titles = wiki.map(w => w.title);
-    return {
-      reason: "ambiguous_term",
-      question: "Did you mean " + titles.slice(0, 3).join(", or ") + "?",
-    };
-  }
-
   // Nothing came back at all → ask for a more specific phrasing.
   if (totalSignal === 0) {
     return {
@@ -389,13 +438,20 @@ function buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages) {
   return null;
 }
 
-function format(query, ia, wiki, results, pages, escalations, weather, ask) {
+function format(query, lang, ia, wiki, results, pages, escalations, weather, ask) {
   const lines = [];
   lines.push("QUERY: " + query);
+  lines.push("RESPONSE_LANGUAGE: " + (lang || "en"));
   if (ask) {
     lines.push("");
     lines.push("ASK: " + ask.question);
     lines.push("ASK_REASON: " + ask.reason);
+  } else {
+    const draft = buildDraft(ia, wiki, weather);
+    if (draft) {
+      lines.push("");
+      lines.push("DRAFT_ANSWER: " + draft);
+    }
   }
   if (weather) {
     lines.push("");
@@ -483,12 +539,12 @@ async function runSearch(rawQuery, lang) {
   // entirely. Edge-device LLMs don't need to wade through travel-guide pages
   // when they already have the live conditions.
   if (weather) {
-    return format(query, ia, wiki, bing, pages, escalations, weather, null);
+    return format(query, lang, ia, wiki, bing, pages, escalations, weather, null);
   }
   // Weather intent but no live data → bail early and ask for a city.
   if (isWeather && !weather) {
     const ask = buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages);
-    return format(query, ia, wiki, bing, pages, escalations, null, ask);
+    return format(query, lang, ia, wiki, bing, pages, escalations, null, ask);
   }
 
   await fetchBatch(bing.slice(0, MAX_PAGES));
@@ -510,7 +566,7 @@ async function runSearch(rawQuery, lang) {
   }
 
   const ask = buildAskHint(rawQuery, query, isWeather, weather, ia, wiki, pages);
-  return format(query, ia, wiki, bing, pages, escalations, weather, ask);
+  return format(query, lang, ia, wiki, bing, pages, escalations, weather, ask);
 }
 
 window["ai_edge_gallery_get_result"] = async (data) => {

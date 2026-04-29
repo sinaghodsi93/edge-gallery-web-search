@@ -16,6 +16,9 @@ The tool returns a JSON object: `{ "result": "<plain-text bundle>" }` on success
 
 ```
 QUERY: <echo of normalized query>
+RESPONSE_LANGUAGE: <the lang code you passed in>
+
+DRAFT_ANSWER: <a 1–3 sentence pre-baked answer>          (when results are good)
 
 ASK: <a clarifying question to relay back to the user>   (only when results
 ASK_REASON: <weather_city_missing | ambiguous_term | no_info>     are weak)
@@ -55,8 +58,9 @@ If the result text contains `NO_DIRECT_INFO_FOUND` (and no `ASK:` was provided),
 
 **Constraints:**
 
-- Provide a concise answer (1–4 complete sentences) grounded in the returned text. Always end with a finished sentence. Your response **must be written in the same language** as the user's original prompt.
-- Prefer `WEATHER` (for weather queries) and then `ANSWER` / `ABSTRACT` / `DEFINITION` when present — they are direct, structured answers. Otherwise synthesize from `WIKIPEDIA` and `PAGES`, and cite the most relevant source URL inline.
+- **If `DRAFT_ANSWER:` is present, base your reply on it.** It's a high-confidence 1–3 sentence answer pre-baked from the best source. Translate it into `RESPONSE_LANGUAGE` if needed, light-edit for tone, and return — do not invent extra facts. This is the safe default for small models.
+- Your reply **must be written in the language given by `RESPONSE_LANGUAGE`** (which matches the user's original prompt). Do not switch languages mid-reply or output a single unrelated word.
+- If no `DRAFT_ANSWER:` is present, provide a concise answer (1–4 complete sentences) grounded in the returned text, ending with a finished sentence. Prefer `WEATHER` (for weather queries) and then `ANSWER` / `ABSTRACT` / `DEFINITION`. Otherwise synthesize from `WIKIPEDIA` and `PAGES` and cite the most relevant source URL inline.
 - If the user's exact question is not answered by the returned text, briefly acknowledge this, then proactively offer the closest related fact you *did* find rather than guessing. If `ASK:` is present, prefer asking that clarifying question over offering a partial guess.
 - Do not invent details that aren't in the returned text. If a section is absent, treat it as missing data, not as a negative answer.
 - Quote at most ~125 characters from any single source; paraphrase otherwise.
